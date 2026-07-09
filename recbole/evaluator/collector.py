@@ -239,7 +239,7 @@ class Collector(object):
             if torch.is_tensor(val):
                 self.data_struct._data_dict[key] = val.cpu()
         returned_struct = copy.deepcopy(self.data_struct)
-        for key in ["rec.topk", "rec.meanrank", "rec.score", "rec.items", "data.label"]:
+        for key in ["rec.topk", "rec.meanrank", "rec.score", "rec.items", "data.label", "data.positive_items"]:
             if key in self.data_struct:
                 del self.data_struct[key]
         return returned_struct
