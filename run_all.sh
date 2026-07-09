@@ -21,7 +21,8 @@ log() { echo "[$(ts)] $*"; }
 run_train() {  # $1=gpu $2=noise_type $3=noise_ratio $4=ckpt_dir $5=logtag
   local gpu=$1 nt=$2 nr=$3 ckpt=$4 tag=$5
   log "TRAIN start $tag  (gpu=$gpu noise=$nt ratio=$nr)"
-  CUDA_VISIBLE_DEVICES=$gpu python run_recbole.py -m $MODEL -d $DS \
+  python run_recbole.py -m $MODEL -d $DS \
+    --gpu_id=$gpu \
     --noise_type=$nt --noise_ratio=$nr --noise_seed=2024 \
     --checkpoint_dir=$ckpt --epochs=$EPOCHS \
     > "logs/train_${tag}.log" 2>&1
@@ -40,8 +41,8 @@ log "===== Phase 1 done ====="
 
 # ---------- Phase 2: CFU 打分（用 clean checkpoint 评 random-10 噪声行）----------
 log "===== Phase 2: CFU scoring ====="
-CUDA_VISIBLE_DEVICES=2 python scripts/cfu_scoring.py \
-  --dataset $DS --model $MODEL \
+python scripts/cfu_scoring.py \
+  --dataset $DS --model $MODEL --gpu_id 2 \
   --noise_type random --noise_ratio 0.1 --noise_seed 2024 \
   --checkpoint_dir saved/beauty_clean --sample_ratio 1.0 \
   --out logs/cfu_beauty_random_10.csv \
@@ -49,8 +50,8 @@ CUDA_VISIBLE_DEVICES=2 python scripts/cfu_scoring.py \
 log "CFU scoring done (exit=$?)"
 
 # popularity 噪声也打一份
-CUDA_VISIBLE_DEVICES=2 python scripts/cfu_scoring.py \
-  --dataset $DS --model $MODEL \
+python scripts/cfu_scoring.py \
+  --dataset $DS --model $MODEL --gpu_id 2 \
   --noise_type popularity --noise_ratio 0.1 --noise_seed 2024 \
   --checkpoint_dir saved/beauty_clean --sample_ratio 1.0 \
   --out logs/cfu_beauty_pop_10.csv \
@@ -70,7 +71,8 @@ log "build weights done"
 # ---------- Phase 4: CFU-weighted 训练（Beauty random-10）----------
 log "===== Phase 4: CFU-weighted training ====="
 run_cfu_train() {  # $1=strategy $2=weight_file $3=logtag
-  CUDA_VISIBLE_DEVICES=2 python run_recbole.py -m $MODEL -d $DS \
+  python run_recbole.py -m $MODEL -d $DS \
+    --gpu_id=2 \
     --noise_type=random --noise_ratio=0.1 --noise_seed=2024 \
     --use_cfu_weight=True --cfu_weight_file=$2 \
     --checkpoint_dir=saved/beauty_$1 --epochs=$EPOCHS \

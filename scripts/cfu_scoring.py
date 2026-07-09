@@ -39,6 +39,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--model", default="SASRec")
+    parser.add_argument("--gpu_id", default="0")
     parser.add_argument("--noise_type", default="random")
     parser.add_argument("--noise_ratio", type=float, default=0.1)
     parser.add_argument("--noise_seed", type=int, default=2024)
@@ -56,6 +57,7 @@ def main():
         "checkpoint_dir": args.checkpoint_dir,
         "show_progress": False,
         "use_gpu": True,
+        "gpu_id": args.gpu_id,
     }
     config = Config(
         model=args.model,
