@@ -52,7 +52,7 @@ def convert():
             except Exception:
                 continue
             uid = obj.get("user_id")
-            iid = obj.get("asin") or obj.get("parent_asin")
+            iid = obj.get("parent_asin") or obj.get("asin")
             rating = obj.get("rating")
             ts = obj.get("timestamp")
             if uid is None or iid is None or rating is None or ts is None:

@@ -193,10 +193,11 @@ class Collector(object):
 
         if self.register.need("data.positive_items"):
             # 每个用户的正样本 item id（仅 full-sort 下 positive_i 为全局 item id）
+            dev = scores_tensor.device
             pos_item_per_user = torch.full(
-                (scores_tensor.shape[0],), -1, dtype=torch.long, device=scores_tensor.device
+                (scores_tensor.shape[0],), -1, dtype=torch.long, device=dev
             )
-            pos_item_per_user[positive_u] = positive_i
+            pos_item_per_user[positive_u.to(dev)] = positive_i.to(dev)
             self.data_struct.update_tensor(
                 "data.positive_items", pos_item_per_user.unsqueeze(1)
             )
