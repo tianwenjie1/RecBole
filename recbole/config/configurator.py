@@ -625,11 +625,17 @@ class Config(object):
     def compatibility_settings(self):
         import numpy as np
 
-        np.bool = np.bool_
-        np.int = np.int_
-        np.float = np.float_
-        np.complex = np.complex_
-        np.object = np.object_
-        np.str = np.str_
-        np.long = np.int_
-        np.unicode = np.unicode_
+        # numpy 2.0 移除了 np.bool/np.float 等别名及 np.float_ 等，这里安全兼容
+        for _name, _target in [
+            ("bool", "bool_"),
+            ("int", "int_"),
+            ("float", "float64"),
+            ("complex", "complex_"),
+            ("object", "object_"),
+            ("str", "str_"),
+            ("long", "int_"),
+            ("unicode", "unicode_"),
+        ]:
+            if not hasattr(np, _name):
+                if hasattr(np, _target):
+                    setattr(np, _name, getattr(np, _target))
