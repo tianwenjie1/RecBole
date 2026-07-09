@@ -40,16 +40,20 @@ def convert():
     import pandas as pd
     df = pd.read_parquet(PARQUET_PATH)
     print(f"[parquet] columns={list(df.columns)}, rows={len(df)}")
-    print(df.head(2).to_string())
-    uid = pick(df, ["user_id", "reviewerID", "reviewer", "user"])
-    iid = pick(df, ["item_id", "asin", "parent_asin", "item"])
-    rating = pick(df, ["rating", "overall", "score"])
-    ts = pick(df, ["timestamp", "unixReviewTime", "time", "date"])
+
+    uid_col = next(c for c in ["reviewerID", "user_id", "user"] if c in df.columns)
+    iid_col = next(c for c in ["asin", "item_id", "parent_asin", "item"] if c in df.columns)
+    time_col = next(c for c in ["reviewTime", "timestamp", "unixReviewTime", "time"] if c in df.columns)
+
+    # 该 parquet 是按用户聚合：asin / reviewTime 是列表。爆开成扁平交互。
+    df = df.explode([iid_col, time_col]).reset_index(drop=True)
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df[time_col] = df[time_col].astype("int64") // 10**9  # unix 秒
     out = pd.DataFrame({
-        "user_id:token": uid.astype(str),
-        "item_id:token": iid.astype(str),
-        "rating:float": rating.astype(float),
-        "timestamp:float": ts.astype(float),
+        "user_id:token": df[uid_col].astype(str),
+        "item_id:token": df[iid_col].astype(str),
+        "rating:float": 1.0,
+        "timestamp:float": df[time_col].astype(float),
     })
     out.to_csv(OUT_PATH, sep="\t", index=False)
     print(f"[done] wrote {len(out)} interactions -> {OUT_PATH}")
