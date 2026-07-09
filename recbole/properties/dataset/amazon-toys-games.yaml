@@ -1,0 +1,35 @@
+# Amazon Toys and Games - 序列推荐鲁棒去噪实验配置（Hour 12 用）
+
+field_separator: "\t"
+seq_separator: " "
+
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+TIME_FIELD: timestamp
+RATING_FIELD: rating
+
+ITEM_LIST_LENGTH_FIELD: item_length
+LIST_SUFFIX: _list
+MAX_ITEM_LIST_LENGTH: 50
+POSITION_FIELD: position_id
+
+load_col:
+    inter: [user_id, item_id, rating, timestamp]
+
+user_inter_num_interval: "[5,inf)"
+item_inter_num_interval: "[5,inf)"
+
+eval_args:
+    split: {'LS': 'valid_and_test'}
+    order: TO
+    mode: full
+repeatable: True
+
+metrics: ['Recall', 'NDCG', 'TailRecall', 'TailNDCG']
+topk: [10, 20]
+valid_metric: NDCG@20
+tail_ratio: 0.2
+
+noise_type: none
+noise_ratio: 0.0
+noise_seed: 2024

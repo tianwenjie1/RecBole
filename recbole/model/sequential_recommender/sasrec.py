@@ -17,6 +17,7 @@ Reference:
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import TransformerEncoder
@@ -50,6 +51,7 @@ class SASRec(SequentialRecommender):
 
         self.initializer_range = config["initializer_range"]
         self.loss_type = config["loss_type"]
+        self.cfu_weight_field = config["cfu_weight_field"]
 
         # define layers and loss
         self.item_embedding = nn.Embedding(
@@ -129,7 +131,12 @@ class SASRec(SequentialRecommender):
         else:  # self.loss_type = 'CE'
             test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            loss = self.loss_fct(logits, pos_items)
+            if self.cfu_weight_field in interaction:
+                w = interaction[self.cfu_weight_field]          # [B]
+                ce = F.cross_entropy(logits, pos_items, reduction="none")  # [B]
+                loss = (ce * w).sum() / w.sum().clamp(min=1e-8)
+            else:
+                loss = self.loss_fct(logits, pos_items)
             return loss
 
     def predict(self, interaction):

@@ -132,6 +132,15 @@ def run_recbole(
     # dataset splitting
     train_data, valid_data, test_data = data_preparation(config, dataset)
 
+    # === 噪声注入：只污染 train_data，valid/test 保持干净 ===
+    from recbole.data.noise_inject import inject_noise
+    inject_noise(train_data._dataset, config, logger=logger)
+
+    # === CFU per-row 权重：把权重列挂到 train_dataset 上 ===
+    if config["use_cfu_weight"]:
+        from recbole.utils.cfu_weight import attach_cfu_weights
+        attach_cfu_weights(train_data._dataset, config, logger=logger)
+
     # model loading and initialization
     init_seed(config["seed"] + config["local_rank"], config["reproducibility"])
     model = get_model(config["model"])(config, train_data._dataset).to(config["device"])

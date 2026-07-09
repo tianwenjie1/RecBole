@@ -49,4 +49,14 @@ topk: [10]                      # (list or int or None) The value of k for topk 
 valid_metric: MRR@10            # (str) The evaluation metric for early stopping. 
 valid_metric_bigger: True       # (bool) Whether to take a bigger valid metric value as a better result.
 eval_batch_size: 4096           # (int) The evaluation batch size.
-metric_decimal_place: 4         # (int) The decimal place of metric scores.
+metric_decimal_place: 4
+tail_ratio: 0.2                    # (float) tail item 占比，用于 TailRecall/TailNDCG
+# === 噪声注入（鲁棒去噪实验）===
+noise_type: none                   # none / random / popularity / context_mismatch
+noise_ratio: 0.0
+noise_seed: 2024
+noise_log_dir: 'logs'
+# === CFU 权重训练 ===
+use_cfu_weight: False
+cfu_weight_file: ~
+cfu_weight_field: 'cfu_weight'         # (int) The decimal place of metric scores.

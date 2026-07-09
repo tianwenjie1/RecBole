@@ -773,3 +773,62 @@ class TailPercentage(AbstractMetric):
             key = "{}@{}".format(metric, k)
             metric_dict[key] = round(avg_result[k - 1], self.decimal_place)
         return metric_dict
+
+
+def _tail_user_mask(dataobject, tail):
+    """返回 bool 数组：该用户 ground-truth item 是否为 tail item。
+
+    需 full-sort 评估（positive_i 为全局 item id）。tail_ratio>1 -> 出现次数 <= tail 的 item；
+    <=1 -> 按训练计数取 bottom tail 份额。
+    """
+    if tail is None or tail <= 0:
+        tail = 0.2
+    pos_items = dataobject.get("data.positive_items").squeeze(-1).numpy()
+    count_items = dict(dataobject.get("data.count_items"))
+    if tail > 1:
+        tail_set = {it for it, cnt in count_items.items() if cnt <= tail}
+    else:
+        sorted_items = sorted(count_items.items(), key=lambda kv: (kv[1], kv[0]))
+        cut = max(int(len(sorted_items) * tail), 1)
+        tail_set = {it for it, _ in sorted_items[:cut]}
+    return np.array([int(p) in tail_set for p in pos_items], dtype=bool)
+
+
+class TailRecall(Recall):
+    r"""Recall@K restricted to users whose ground-truth item is a long-tail item."""
+
+    metric_need = ["rec.topk", "data.positive_items", "data.count_items"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.tail = config["tail_ratio"]
+
+    def calculate_metric(self, dataobject):
+        pos_index, pos_len = self.used_info(dataobject)
+        result = self.metric_info(pos_index, pos_len)
+        mask = _tail_user_mask(dataobject, self.tail)
+        if mask.sum() == 0:
+            result = np.zeros_like(result)
+        else:
+            result = result[mask]
+        return self.topk_result("tailrecall", result)
+
+
+class TailNDCG(NDCG):
+    r"""NDCG@K restricted to users whose ground-truth item is a long-tail item."""
+
+    metric_need = ["rec.topk", "data.positive_items", "data.count_items"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.tail = config["tail_ratio"]
+
+    def calculate_metric(self, dataobject):
+        pos_index, pos_len = self.used_info(dataobject)
+        result = self.metric_info(pos_index, pos_len)
+        mask = _tail_user_mask(dataobject, self.tail)
+        if mask.sum() == 0:
+            result = np.zeros_like(result)
+        else:
+            result = result[mask]
+        return self.topk_result("tailndcg", result)
