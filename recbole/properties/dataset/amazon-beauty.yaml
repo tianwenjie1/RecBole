@@ -34,6 +34,9 @@ topk: [10, 20]
 valid_metric: NDCG@20
 tail_ratio: 0.2
 
+# SASRec 用 CE loss（全 softmax），不需要负采样
+train_neg_sample_args: ~
+
 # 噪声注入开关（默认 clean）
 noise_type: none
 noise_ratio: 0.0

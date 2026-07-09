@@ -30,6 +30,8 @@ topk: [10, 20]
 valid_metric: NDCG@20
 tail_ratio: 0.2
 
+train_neg_sample_args: ~
+
 noise_type: none
 noise_ratio: 0.0
 noise_seed: 2024
