@@ -17,7 +17,10 @@ import torch.distributed as dist
 from collections.abc import MutableMapping
 from logging import getLogger
 
-from ray import tune
+try:
+    from ray import tune
+except Exception:  # ray / pkg_resources 缺失时跳过，普通训练不需要 ray
+    tune = None
 
 from recbole.config import Config
 from recbole.data import (
@@ -229,7 +232,8 @@ def objective_function(config_dict=None, config_file_list=None, saved=True):
     )
     test_result = trainer.evaluate(test_data, load_best_model=saved)
 
-    tune.report(**test_result)
+    if tune is not None:
+        tune.report(**test_result)
     return {
         "model": model_name,
         "best_valid_score": best_valid_score,
