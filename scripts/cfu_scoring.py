@@ -24,7 +24,8 @@ from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
 from recbole.data.interaction import Interaction
 from recbole.data.noise_inject import inject_noise
-from recbole.utils import init_seed, get_model, init_logger, get_logger
+from recbole.utils import init_seed, get_model, init_logger
+from logging import getLogger
 
 
 def find_checkpoint(checkpoint_dir, model_name):

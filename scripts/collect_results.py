@@ -23,7 +23,7 @@ TAG_DESC = {
 
 
 def parse_test_result(path):
-    """从 log 里抓最后一行 'test result: {...}' 并 eval 成 dict。"""
+    """从 log 里抓最后一行 'test result: OrderedDict([...])' 解析成 dict。"""
     if not os.path.exists(path):
         return None
     last = None
@@ -33,13 +33,18 @@ def parse_test_result(path):
                 last = line
     if last is None:
         return None
-    m = re.search(r"test result.*?(\{.*\})", last)
-    if not m:
+    # 形如: ('recall@20', np.float64(0.2246))
+    pairs = re.findall(r"\('([\w@]+)',\s*np\.float64\(([\d.]+)\)\)", last)
+    if not pairs:
+        # 兼容旧版纯 dict 格式 {'recall@10': 0.x, ...}
+        m = re.search(r"test result.*?(\{.*\})", last)
+        if m:
+            try:
+                return ast.literal_eval(m.group(1))
+            except Exception:
+                return None
         return None
-    try:
-        return ast.literal_eval(m.group(1))
-    except Exception:
-        return None
+    return {k: float(v) for k, v in pairs}
 
 
 def fmt(d, key):
