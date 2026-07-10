@@ -98,7 +98,8 @@ def build_multistep_inputs(seq_np, length_np, target_np, uid_np, horizons, max_l
             ld = min(len(logical_del), max_len)
             arr_d[max_len - ld:] = logical_del[-ld:]
             inp_orig.append(arr_o); inp_mask.append(arr_m); inp_rep.append(arr_r); inp_del.append(arr_d)
-            lens_orig.append(lo); lens_del.append(ld)
+            lens_orig.append(max(lo, 1))      # clamp ≥1 防 gather 越界（L=1 时 del 为空）
+            lens_del.append(max(ld, 1))
             rows.append(j); ks.append(k); future.append(fut)
     return (np.array(rows), np.array(ks), np.array(future),
             np.stack(inp_orig), np.stack(inp_mask), np.stack(inp_rep), np.stack(inp_del),
