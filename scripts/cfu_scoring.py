@@ -284,23 +284,23 @@ def main():
     M = len(rows)
     logger.info(f"[cfu] multistep pairs = {M} (avg {M/N:.2f} horizons/row)")
 
-    # 各视图 forward（orig/mask/del/rep），orig/mask/rep 跑 dropout，del 仅 eval
+    # CFU 均值用 eval（无 dropout，干净，与 Part1 一致）；dropout 只用于不确定性 std
     dropout_modules = [m for m in model.modules() if isinstance(m, torch.nn.Dropout)]
-    logger.info(f"[cfu] forward 4 views × {args.n_dropout} dropout (orig/mask/rep) + eval (del)...")
-    sc_o, ce_o = forward_loss_dropout(model, inp_o, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
-    sc_m, ce_m = forward_loss_dropout(model, inp_m, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
-    sc_r, ce_r = forward_loss_dropout(model, inp_r, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
-    sc_d, ce_d = forward_loss(model, inp_d, lens_d, future, item_emb_w, device, bs)  # eval
+    logger.info(f"[cfu] forward 4 views (eval) + {args.n_dropout} dropout (orig/mask for std)...")
+    sc_o, ce_o = forward_loss(model, inp_o, lens_o, future, item_emb_w, device, bs)
+    sc_m, _ = forward_loss(model, inp_m, lens_o, future, item_emb_w, device, bs)
+    sc_r, _ = forward_loss(model, inp_r, lens_o, future, item_emb_w, device, bs)
+    sc_d, ce_d = forward_loss(model, inp_d, lens_d, future, item_emb_w, device, bs)
 
-    sc_o_mean = sc_o.mean(axis=0)
-    sc_m_mean = sc_m.mean(axis=0)
-    sc_r_mean = sc_r.mean(axis=0)
-    ce_o_mean = ce_o.mean(axis=0)
+    # CFU = score_orig - score_cf（score 空间，正=有用）
+    cfu_del = sc_o - sc_d
+    cfu_mask = sc_o - sc_m
+    cfu_rep = sc_o - sc_r
 
-    # CFU = score_orig - score_cf（score 空间，正=有用，与 Part1 一致，比 loss 空间干净）
-    cfu_del = sc_o_mean - sc_d
-    cfu_mask = sc_o_mean - sc_m_mean
-    cfu_rep = sc_o_mean - sc_r_mean
+    # 不确定性：orig+mask 的 dropout pass，算 per-pass H_mask 的 std
+    sc_o_drop, _ = forward_loss_dropout(model, inp_o, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    sc_m_drop, _ = forward_loss_dropout(model, inp_m, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    Hmask_pass = sc_o_drop - sc_m_drop   # [P, M]
 
     # 按 (row, k) 聚合到每行
     row_to_idx = {}
@@ -329,7 +329,7 @@ def main():
         i1 = hmap.get(1)
         rec["CFU_mask"] = float(cfu_mask[i1]) if i1 is not None else 0.0
         rec["CFU_delete"] = float(cfu_del[i1]) if i1 is not None else 0.0
-        rec["orig_loss"] = float(ce_o_mean[i1]) if i1 is not None else 0.0
+        rec["orig_loss"] = float(ce_o[i1]) if i1 is not None else 0.0
         # 多步
         for ki, k in enumerate(horizons):
             idx_k = hmap.get(k)
@@ -353,7 +353,7 @@ def main():
                     idx_k = hmap.get(k)
                     if idx_k is None:
                         continue
-                    hp += alpha_w[ki] * (sc_o[p, idx_k] - sc_m[p, idx_k])
+                    hp += alpha_w[ki] * Hmask_pass[p, idx_k]
                     sw += alpha_w[ki]
                 if sw > 0:
                     pass_H.append(hp / sw)
