@@ -103,8 +103,8 @@ for job in "${QUEUE[@]}"; do
   fi
   # 写 meta json 方便 collect_results 解析（避免文件名歧义）
   python -c "import json; json.dump({'pos':'$pos','sel':'$selname','seed':'$SEED','log':'$logfile','repair_json':'logs/repair_${pos}_${selname}.json'}, open('logs/meta__${tag}.json','w'))"
-  # timeout 600s 防止任务卡在退出清理阶段（get_environment 偶发挂死）
-  timeout 600 $cmd > "$logfile" 2>&1 &
+  # timeout 1200s 防止任务卡在退出清理阶段（loss_reweight 训练较慢，给足 20 分钟）
+  timeout 1200 $cmd > "$logfile" 2>&1 &
   log "START $tag (gpu=$gpu)"
   i=$((i+1))
   if [ $((i % 2)) -eq 0 ]; then wait; log "batch done"; fi

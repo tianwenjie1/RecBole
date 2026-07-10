@@ -16,26 +16,27 @@ METRIC_KEYS = ["recall@20", "ndcg@20", "tailrecall@20", "tailndcg@20"]
 
 
 def parse_result_line(path, keyword):
-    """从 log 抓最后一条 keyword 行（'valid result'/'test result'），解析 OrderedDict。"""
+    """从 log 抓最后一条 keyword 行（'valid result'/'test result'），解析 OrderedDict。
+    RecBole 的 valid result: 和指标可能分两行，所以也看 keyword 行的下一行。"""
     if not os.path.exists(path):
         return None
-    last = None
     with open(path, "r", errors="ignore") as f:
-        for line in f:
-            if keyword in line:
-                last = line
-    if last is None:
+        lines = f.readlines()
+    idxs = [i for i, ln in enumerate(lines) if keyword in ln]
+    if not idxs:
         return None
-    pairs = re.findall(r"\('([\w@]+)',\s*np\.float64\(([\d.]+)\)\)", last)
-    if not pairs:
-        m = re.search(r"test result.*?(\{.*\})", last)
-        if m:
-            try:
-                return ast.literal_eval(m.group(1))
-            except Exception:
-                return None
-        return None
-    return {k: float(v) for k, v in pairs}
+    idx = idxs[-1]
+    # 试 keyword 行本身 + 下一行（指标可能在下一行）
+    for cand in [lines[idx], lines[idx + 1] if idx + 1 < len(lines) else ""]:
+        pairs = re.findall(r"\('([\w@]+)',\s*np\.float64\(([\d.]+)\)\)", cand)
+        if not pairs:
+            # 兼容 'recall@20 : 0.2246' 这种空格分隔格式
+            sp = re.findall(r"([\w@]+)\s*:\s*([\d.]+)", cand)
+            if sp and any(k in ["recall@20", "ndcg@20"] for k, _ in sp):
+                return {k: float(v) for k, v in sp}
+        else:
+            return {k: float(v) for k, v in pairs}
+    return None
 
 
 def fmt(d, key):
