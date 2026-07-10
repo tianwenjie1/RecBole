@@ -36,14 +36,18 @@ declare -a QUEUE
 enqueue() { QUEUE+=("$1|$2|$3|$4"); }   # gpu|pos|selkind|selarg
 
 for pos in "${POSITIONS[@]}"; do
-  # 1. cfu 打分（带 position 标签）
-  log "CFU scoring position=$pos"
-  python scripts/cfu_scoring.py --dataset $DS --model $MODEL --gpu_id ${GPUS[0]} \
-    --noise_type random --noise_ratio $RATIO --noise_seed $SEED --noise_position $pos \
-    --checkpoint_dir saved/beauty_clean --sample_ratio 1.0 \
-    --out logs/cfu_${DS}_random_10_${pos}.csv \
-    > logs/cfu_${DS}_random_10_${pos}.log 2>&1
+  # 1. cfu 打分（带 position 标签；已存在则跳过）
   CFU=logs/cfu_${DS}_random_10_${pos}.csv
+  if [ -f "$CFU" ]; then
+    log "CFU skip position=$pos (csv 已存在)"
+  else
+    log "CFU scoring position=$pos"
+    python scripts/cfu_scoring.py --dataset $DS --model $MODEL --gpu_id ${GPUS[0]} \
+      --noise_type random --noise_ratio $RATIO --noise_seed $SEED --noise_position $pos \
+      --checkpoint_dir saved/beauty_clean --sample_ratio 1.0 \
+      --out "$CFU" \
+      > logs/cfu_${DS}_random_10_${pos}.log 2>&1
+  fi
 
   # 2. baseline: noisy（无 repair）
   enqueue "${GPUS[0]}" "$pos" "noisy" "-"
@@ -92,9 +96,15 @@ for job in "${QUEUE[@]}"; do
   fi
   tag="${pos}__${selname}__seed${SEED}"
   logfile="logs/sweep_train__${tag}.log"
+  # 跳过已完成（日志含 test result），支持断点续跑
+  if grep -q "test result" "$logfile" 2>/dev/null; then
+    log "SKIP $tag (已完成)"
+    continue
+  fi
   # 写 meta json 方便 collect_results 解析（避免文件名歧义）
   python -c "import json; json.dump({'pos':'$pos','sel':'$selname','seed':'$SEED','log':'$logfile','repair_json':'logs/repair_${pos}_${selname}.json'}, open('logs/meta__${tag}.json','w'))"
-  $cmd > "$logfile" 2>&1 &
+  # timeout 600s 防止任务卡在退出清理阶段（get_environment 偶发挂死）
+  timeout 600 $cmd > "$logfile" 2>&1 &
   log "START $tag (gpu=$gpu)"
   i=$((i+1))
   if [ $((i % 2)) -eq 0 ]; then wait; log "batch done"; fi
