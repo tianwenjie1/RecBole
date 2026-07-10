@@ -44,30 +44,29 @@ def prepare_scores(df, gamma=0.5):
     return df
 
 
-def matched_risk(df, cal_mask, deploy_mask, methods, alphas, beta, delta, group_keys, budget, out_dir):
-    """对每方法×alpha 选 conformal 阈值，输出 repair csv + validate。"""
+def matched_risk(df, cal_mask, deploy_mask, methods, alphas, beta, delta, group_keys, budget, out_dir, kappa=0.0):
+    """对每方法×alpha 选 conformal 阈值，输出 repair csv + validate。
+    kappa=0 公平比检测分数质量（所有方法无弃权）；kappa>0 时 ours 用 H_del_std 弃权。"""
+    df["_zero"] = 0.0
     rows = []
     for mname, (score_col, std_col) in methods.items():
+        std_col_use = std_col if (kappa > 0 and std_col and std_col in df) else "_zero"
         for alpha in alphas:
             thresholds, fb = select_thresholds(df, cal_mask, score_col, alpha, beta, delta, group_keys)
             if fb is None:
                 print(f"  {mname} a={alpha}: 阈值选取失败（组太小？）跳过")
                 continue
-            c, _ = apply_budget(df, deploy_mask, score_col, thresholds, group_keys, budget, 1.0, std_col or "_zero")
-            if std_col is None or std_col not in df:
-                df["_zero"] = 0.0
-                std_col_use = "_zero"
-            else:
-                std_col_use = std_col
+            c, _ = apply_budget(df, deploy_mask, score_col, thresholds, group_keys, budget, kappa, std_col_use)
             tag = f"{mname}__a{alpha}"
             out_csv = os.path.join(out_dir, f"repair_{tag}.csv")
             all_mask = np.ones(len(df), dtype=bool)
             n_repair = build_repair_csv(df, all_mask, score_col, std_col_use, thresholds, group_keys,
-                                        c, 1.0, "replace", "pred_item", out_csv)
-            val = validate_deploy(df, deploy_mask, score_col, std_col_use, thresholds, group_keys, c, 1.0)
-            rows.append({"method": mname, "alpha": alpha, "score": score_col, **val})
+                                        c, kappa, "replace", "pred_item", out_csv)
+            val = validate_deploy(df, deploy_mask, score_col, std_col_use, thresholds, group_keys, c, kappa)
+            rows.append({"method": mname, "alpha": alpha, "score": score_col, "kappa": kappa, **val})
             with open(os.path.join(out_dir, f"calib_{tag}.json"), "w") as f:
-                json.dump({"method": mname, "alpha": alpha, "c": c, "deploy_validate": val,
+                json.dump({"method": mname, "alpha": alpha, "c": c, "kappa": kappa,
+                           "deploy_validate": val,
                            "thresholds": {str(k): v for k, v in thresholds.items()}}, f, indent=2)
             print(f"  {mname:14s} a={alpha}: tail_FPR={val['tail_FPR']:.4f} noise_prec={val['noise_precision']:.4f} "
                   f"noise_recall={val['noise_recall']:.4f} budget={val['budget_actual']:.4f}")
@@ -121,6 +120,7 @@ def main():
     ap.add_argument("--group_keys", default="pop_bucket,pos_bucket")
     ap.add_argument("--cal_frac", type=float, default=0.5)
     ap.add_argument("--gamma", type=float, default=0.5)
+    ap.add_argument("--kappa", type=float, default=0.0, help="0=公平比检测分数质量(无弃权); >0 时 ours 用 H_del_std 弃权")
     args = ap.parse_args()
 
     df = pd.read_csv(args.cfu_csv)
@@ -131,8 +131,8 @@ def main():
     group_keys = args.group_keys.split(",")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print(f"=== matched-risk (tail-FPR 受控) ===  cal={cal_mask.sum()} deploy={deploy_mask.sum()}")
-    mr = matched_risk(df, cal_mask, deploy_mask, METHODS, alphas, args.beta, args.delta, group_keys, args.budget_cap, args.out_dir)
+    print(f"=== matched-risk (tail-FPR 受控, kappa={args.kappa}) ===  cal={cal_mask.sum()} deploy={deploy_mask.sum()}")
+    mr = matched_risk(df, cal_mask, deploy_mask, METHODS, alphas, args.beta, args.delta, group_keys, args.budget_cap, args.out_dir, args.kappa)
     print(f"\n=== matched-budget (固定修复比例) ===")
     mb = matched_budget(df, cal_mask, deploy_mask, METHODS, budgets, group_keys, args.out_dir)
 
