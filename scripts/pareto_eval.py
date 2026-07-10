@@ -25,12 +25,13 @@ from scipy.stats import beta as beta_dist
 from calibrate_risk import split_cal_deploy, cp_upper, group_threshold, select_thresholds, apply_budget, build_repair_csv, validate_deploy
 
 
-METHODS = {
-    "ours": ("H_del_mean", "H_del_std"),
-    "cfu_single": ("CFU_delete", None),         # CARD-PER 信号
-    "loss_reweight": ("_neg_orig_loss", None),  # -orig_loss
-    "pad_like": ("_pad_like", None),
-}
+# 方法：(name, score_col, std_col, kappa)。proposed = cfu_single + 风险控制 + abstention
+METHODS = [
+    ("loss_reweight_rc", "_neg_orig_loss", None, 0.0),
+    ("pad_like_rc", "_pad_like", None, 0.0),
+    ("cfu_single_rc", "CFU_delete", None, 0.0),
+    ("proposed", "CFU_delete", "H_del_std", 1.0),   # 单步 CFU + 风险控制 + 弃权
+]
 
 
 def prepare_scores(df, gamma=0.5):
@@ -45,38 +46,37 @@ def prepare_scores(df, gamma=0.5):
 
 
 def matched_risk(df, cal_mask, deploy_mask, methods, alphas, beta, delta, group_keys, budget, out_dir, kappa=0.0):
-    """对每方法×alpha 选 conformal 阈值，输出 repair csv + validate。
-    kappa=0 公平比检测分数质量（所有方法无弃权）；kappa>0 时 ours 用 H_del_std 弃权。"""
+    """对每方法×alpha 选 conformal 阈值，输出 repair csv + validate。每方法自带 kappa/std。"""
     df["_zero"] = 0.0
     rows = []
-    for mname, (score_col, std_col) in methods.items():
-        std_col_use = std_col if (kappa > 0 and std_col and std_col in df) else "_zero"
+    for mname, score_col, std_col, m_kappa in methods:
+        std_col_use = std_col if (m_kappa > 0 and std_col and std_col in df) else "_zero"
         for alpha in alphas:
             thresholds, fb = select_thresholds(df, cal_mask, score_col, alpha, beta, delta, group_keys)
             if fb is None:
                 print(f"  {mname} a={alpha}: 阈值选取失败（组太小？）跳过")
                 continue
-            c, _ = apply_budget(df, deploy_mask, score_col, thresholds, group_keys, budget, kappa, std_col_use)
+            c, _ = apply_budget(df, deploy_mask, score_col, thresholds, group_keys, budget, m_kappa, std_col_use)
             tag = f"{mname}__a{alpha}"
             out_csv = os.path.join(out_dir, f"repair_{tag}.csv")
             all_mask = np.ones(len(df), dtype=bool)
             n_repair = build_repair_csv(df, all_mask, score_col, std_col_use, thresholds, group_keys,
-                                        c, kappa, "replace", "pred_item", out_csv)
-            val = validate_deploy(df, deploy_mask, score_col, std_col_use, thresholds, group_keys, c, kappa)
-            rows.append({"method": mname, "alpha": alpha, "score": score_col, "kappa": kappa, **val})
+                                        c, m_kappa, "replace", "pred_item", out_csv)
+            val = validate_deploy(df, deploy_mask, score_col, std_col_use, thresholds, group_keys, c, m_kappa)
+            rows.append({"method": mname, "alpha": alpha, "score": score_col, "kappa": m_kappa, **val})
             with open(os.path.join(out_dir, f"calib_{tag}.json"), "w") as f:
-                json.dump({"method": mname, "alpha": alpha, "c": c, "kappa": kappa,
+                json.dump({"method": mname, "alpha": alpha, "c": c, "kappa": m_kappa,
                            "deploy_validate": val,
                            "thresholds": {str(k): v for k, v in thresholds.items()}}, f, indent=2)
-            print(f"  {mname:14s} a={alpha}: tail_FPR={val['tail_FPR']:.4f} noise_prec={val['noise_precision']:.4f} "
-                  f"noise_recall={val['noise_recall']:.4f} budget={val['budget_actual']:.4f}")
+            print(f"  {mname:18s} a={alpha}: tail_FPR={val['tail_FPR']:.4f} noise_prec={val['noise_precision']:.4f} "
+                  f"noise_recall={val['noise_recall']:.4f} budget={val['budget_actual']:.4f} abstain_kappa={m_kappa}")
     return rows
 
 
 def matched_budget(df, cal_mask, deploy_mask, methods, budgets, group_keys, out_dir):
     """每方法固定修复 budget 比例（per-group percentile 等价全局 percentile）。输出 repair csv。"""
     rows = []
-    for mname, (score_col, _) in methods.items():
+    for mname, score_col, _, _ in methods:
         s = df[score_col].fillna(0).values
         for budget in budgets:
             thr = np.quantile(s, budget)   # 修 bottom budget 比例
