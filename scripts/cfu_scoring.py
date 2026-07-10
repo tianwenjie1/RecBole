@@ -116,10 +116,12 @@ def build_multistep_inputs(seq_np, length_np, target_np, uid_np, horizons, max_l
 
 
 def forward_loss(model, inp, lens, future, item_emb_w, device, bs):
-    """返回 CE loss [M]（eval 模式，无 dropout）。"""
+    """返回 (target_score [M], ce_loss [M])（eval 模式）。
+    score = seq_output · emb(future)（score-space CFU 用）；ce 供 orig_loss。"""
     import torch.nn.functional as F
     M = inp.shape[0]
-    losses = np.empty(M, dtype=np.float64)
+    scores = np.empty(M, dtype=np.float64)
+    ces = np.empty(M, dtype=np.float64)
     model.eval()
     with torch.no_grad():
         for s in range(0, M, bs):
@@ -129,17 +131,18 @@ def forward_loss(model, inp, lens, future, item_emb_w, device, bs):
             fi = torch.from_numpy(future[s:e]).to(device).long()
             out = model.forward(si, li)
             logits = torch.matmul(out, item_emb_w.transpose(0, 1))
-            losses[s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
-    return losses
+            scores[s:e] = logits[torch.arange(e - s, device=device), fi].cpu().numpy()
+            ces[s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
+    return scores, ces
 
 
 def forward_loss_dropout(model, inp, lens, future, item_emb_w, device, bs, n_pass, dropout_modules):
-    """n_pass 次 dropout inference，返回 loss [n_pass, M]。"""
+    """n_pass 次 dropout inference，返回 (scores [P,M], ces [P,M])。"""
     import torch.nn.functional as F
     M = inp.shape[0]
-    all_loss = np.empty((n_pass, M), dtype=np.float64)
+    all_score = np.empty((n_pass, M), dtype=np.float64)
+    all_ce = np.empty((n_pass, M), dtype=np.float64)
     for p in range(n_pass):
-        # 只开 dropout 子模块，其余 eval
         model.eval()
         for m in dropout_modules:
             m.train()
@@ -151,8 +154,9 @@ def forward_loss_dropout(model, inp, lens, future, item_emb_w, device, bs, n_pas
                 fi = torch.from_numpy(future[s:e]).to(device).long()
                 out = model.forward(si, li)
                 logits = torch.matmul(out, item_emb_w.transpose(0, 1))
-                all_loss[p, s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
-    return all_loss
+                all_score[p, s:e] = logits[torch.arange(e - s, device=device), fi].cpu().numpy()
+                all_ce[p, s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
+    return all_score, all_ce
 
 
 def calibrate_zscore(score, pop_bucket, pos_bucket, clean_mask):
@@ -280,22 +284,23 @@ def main():
     M = len(rows)
     logger.info(f"[cfu] multistep pairs = {M} (avg {M/N:.2f} horizons/row)")
 
-    # 各视图 forward（orig/mask/del/rep），orig/mask/rep 跑 dropout，del 仅 eval（主指标）
+    # 各视图 forward（orig/mask/del/rep），orig/mask/rep 跑 dropout，del 仅 eval
     dropout_modules = [m for m in model.modules() if isinstance(m, torch.nn.Dropout)]
     logger.info(f"[cfu] forward 4 views × {args.n_dropout} dropout (orig/mask/rep) + eval (del)...")
-    loss_o = forward_loss_dropout(model, inp_o, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)  # [P,M]
-    loss_m = forward_loss_dropout(model, inp_m, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
-    loss_r = forward_loss_dropout(model, inp_r, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
-    loss_d = forward_loss(model, inp_d, lens_d, future, item_emb_w, device, bs)  # [M] eval
+    sc_o, ce_o = forward_loss_dropout(model, inp_o, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    sc_m, ce_m = forward_loss_dropout(model, inp_m, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    sc_r, ce_r = forward_loss_dropout(model, inp_r, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    sc_d, ce_d = forward_loss(model, inp_d, lens_d, future, item_emb_w, device, bs)  # eval
 
-    loss_o_mean = loss_o.mean(axis=0); loss_o_std = loss_o.std(axis=0, ddof=1) if args.n_dropout > 1 else np.zeros(M)
-    loss_m_mean = loss_m.mean(axis=0)
-    loss_r_mean = loss_r.mean(axis=0)
+    sc_o_mean = sc_o.mean(axis=0)
+    sc_m_mean = sc_m.mean(axis=0)
+    sc_r_mean = sc_r.mean(axis=0)
+    ce_o_mean = ce_o.mean(axis=0)
 
-    # CFU_k = loss_cf - loss_orig（loss 空间，正=有用）
-    cfu_del = loss_d - loss_o_mean
-    cfu_mask = loss_m_mean - loss_o_mean
-    cfu_rep = loss_r_mean - loss_o_mean
+    # CFU = score_orig - score_cf（score 空间，正=有用，与 Part1 一致，比 loss 空间干净）
+    cfu_del = sc_o_mean - sc_d
+    cfu_mask = sc_o_mean - sc_m_mean
+    cfu_rep = sc_o_mean - sc_r_mean
 
     # 按 (row, k) 聚合到每行
     row_to_idx = {}
@@ -324,15 +329,14 @@ def main():
         i1 = hmap.get(1)
         rec["CFU_mask"] = float(cfu_mask[i1]) if i1 is not None else 0.0
         rec["CFU_delete"] = float(cfu_del[i1]) if i1 is not None else 0.0
-        rec["orig_loss"] = float(loss_o_mean[i1]) if i1 is not None else 0.0
+        rec["orig_loss"] = float(ce_o_mean[i1]) if i1 is not None else 0.0
         # 多步
-        h_del_pass = []  # 每 dropout pass 的 H_del（用 del 是 eval，故 H_del 无 std；用 mask 做 std）
         for ki, k in enumerate(horizons):
             idx_k = hmap.get(k)
             rec[f"CFU_del_H{k}"] = float(cfu_del[idx_k]) if idx_k is not None else float("nan")
             rec[f"CFU_mask_H{k}"] = float(cfu_mask[idx_k]) if idx_k is not None else float("nan")
             rec[f"CFU_rep_H{k}"] = float(cfu_rep[idx_k]) if idx_k is not None else float("nan")
-        # H_del = Σ α_k CFU_del_Hk（只对有效 horizon 重归一化，跳过 NaN 防 0*nan 污染）
+        # H_del = Σ α_k CFU_del_Hk（只对有效 horizon 重归一化，跳过 NaN）
         vals = [rec[f"CFU_del_H{k}"] for k in horizons]
         num = 0.0; den = 0.0
         for i, v in enumerate(vals):
@@ -340,7 +344,7 @@ def main():
                 num += alpha_w[i] * v
                 den += alpha_w[i]
         rec["H_del_mean"] = float(num / den) if den > 0 else 0.0
-        # H_del 不确定性：用 mask 视图各 dropout pass 的 H_mask 做 std 作代理
+        # H_del 不确定性：用 mask 视图各 dropout pass 的 H_mask(score-space) 做 std
         if args.n_dropout > 1 and i1 is not None:
             pass_H = []
             for p in range(args.n_dropout):
@@ -349,7 +353,7 @@ def main():
                     idx_k = hmap.get(k)
                     if idx_k is None:
                         continue
-                    hp += alpha_w[ki] * (loss_m[p, idx_k] - loss_o[p, idx_k])
+                    hp += alpha_w[ki] * (sc_o[p, idx_k] - sc_m[p, idx_k])
                     sw += alpha_w[ki]
                 if sw > 0:
                     pass_H.append(hp / sw)
