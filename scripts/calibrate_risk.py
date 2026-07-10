@@ -195,7 +195,9 @@ def main():
                     c, n_rep = apply_budget(df, deploy_mask, args.score, thresholds, group_keys, budget, kappa, args.std)
                     tag = f"{args.score}__a{alpha}_b{beta}_B{budget}_k{kappa}"
                     out_csv = os.path.join(args.out_dir, f"repair_{tag}.csv")
-                    n_repair = build_repair_csv(df, deploy_mask, args.score, args.std, thresholds, group_keys,
+                    # 训练用：阈值应用到【全部行】修复（cal+deploy 都修）；validate 仅在 deploy 上公平评估
+                    all_mask = np.ones(len(df), dtype=bool)
+                    n_repair = build_repair_csv(df, all_mask, args.score, args.std, thresholds, group_keys,
                                                 c, kappa, args.action, args.pred_col, out_csv)
                     val = validate_deploy(df, deploy_mask, args.score, args.std, thresholds, group_keys, c, kappa)
                     calib = {
