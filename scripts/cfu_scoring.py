@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-# CFU 离线打分：用 clean checkpoint 对训练序列的「最后一个历史 item」算反事实未来效用。
+# CFU 离线打分（Stage 1）：多步反事实未来效用 + 群体校准 + 不确定性。
 #
-# CFU(x_t) = score(x_{t+1} | seq) - score(x_{t+1} | seq_{counterfactual})
-#   - mask:   把最后一个历史 item 置 0（padding），保留长度
-#   - delete: 把最后一个历史 item 置 0，长度 -1
+# 对每行训练样本 j（prefix 结束于 x_t，target = x_{t+1}），对 horizon k∈{1,3,5}：
+#   预测 x_{t+k}。input = prefix(x_a..x_t) + bridge(x_{t+1}..x_{t+k-1})，future_target = x_{t+k}。
+#   RecBole 的 data_augmentation 保证同 user 行按 time 排序、target 连续，故
+#   x_{t+m} = target[j+m-1]（同 uid）。bridge = target[j..j+k-2]，future = target[j+k-1]。
+# 三视图：orig / mask(x_t→0) / del(删 x_t) / replace(x_t→pred_item)。
+# CFU_del_Hk = ℓ_cf - ℓ_orig（loss 空间，正=有用）。3 次 dropout inference 估不确定性。
+# 群体校准 z-score（pop×pos 分组，median/MAD）。
 #
-# 输出 csv: row, uid, position, last_item, future_item, item_popularity, is_tail,
-#          is_injected_noise, noise_type, CFU_mask, CFU_delete
-# 并打印 4 类样本统计 + 存分布图。
+# 输出 csv（向后兼容旧列 + 新列）。打印单步/多步 ROC-AUC/PR-AUC + 分组均值。
 
 import os
 import sys
@@ -22,7 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
-from recbole.data.interaction import Interaction
 from recbole.data.noise_inject import inject_noise
 from recbole.utils import init_seed, get_model, init_logger
 from logging import getLogger
@@ -36,6 +37,132 @@ def find_checkpoint(checkpoint_dir, model_name):
     return files[-1]
 
 
+def build_user_row_index(uid_np):
+    """uid 已排序，返回 {uid: [row_start..row_end]}。"""
+    idx = {}
+    cur = None
+    start = 0
+    for i in range(len(uid_np)):
+        u = int(uid_np[i])
+        if cur is None:
+            cur = u
+            start = i
+        elif u != cur:
+            idx[cur] = np.arange(start, i)
+            cur = u
+            start = i
+    if cur is not None:
+        idx[cur] = np.arange(start, len(uid_np))
+    return idx
+
+
+def build_multistep_inputs(seq_np, length_np, target_np, uid_np, horizons, max_len, pred_item_np):
+    """构造多步 4 视图输入。返回 flat arrays（M = 有效 (row,k) 数）。
+
+    x_t 在 padded 数组中的列号恒为 max_len - k（k≤5 << max_len，必在窗内）。
+    """
+    N = len(length_np)
+    rows, ks, future = [], [], []
+    inp_orig, inp_mask, inp_rep = [], [], []   # 同长 L+k-1
+    inp_del = []                                # 长 L+k-2
+    lens_orig, lens_del = [], []
+    for j in range(N):
+        L = int(length_np[j])
+        if L < 1:
+            continue
+        prefix = seq_np[j, :L].tolist()          # [x_a..x_t]
+        u = int(uid_np[j])
+        for k in horizons:
+            if j + k - 1 >= N:
+                continue
+            # 有效性：j..j+k-1 同 uid（排序下判首尾即可）
+            if int(uid_np[j + k - 1]) != u:
+                continue
+            bridge = target_np[j:j + k - 1].tolist()     # x_{t+1}..x_{t+k-1}（k-1 个）
+            fut = int(target_np[j + k - 1])               # x_{t+k}
+            logical_orig = prefix + bridge                # 长 L+k-1
+            xt_pad_pos = max_len - k                      # x_t 在 padded 中的列号
+            # orig/mask/rep 长 L+k-1
+            arr_o = np.zeros(max_len, dtype=np.int64)
+            arr_m = np.zeros(max_len, dtype=np.int64)
+            arr_r = np.zeros(max_len, dtype=np.int64)
+            lo = min(len(logical_orig), max_len)
+            arr_o[max_len - lo:] = logical_orig[-lo:]
+            arr_m[max_len - lo:] = logical_orig[-lo:]
+            arr_r[max_len - lo:] = logical_orig[-lo:]
+            arr_m[xt_pad_pos] = 0
+            arr_r[xt_pad_pos] = int(pred_item_np[j])
+            # del 长 L+k-2（删 x_t）
+            logical_del = prefix[:L - 1] + bridge
+            arr_d = np.zeros(max_len, dtype=np.int64)
+            ld = min(len(logical_del), max_len)
+            arr_d[max_len - ld:] = logical_del[-ld:]
+            inp_orig.append(arr_o); inp_mask.append(arr_m); inp_rep.append(arr_r); inp_del.append(arr_d)
+            lens_orig.append(lo); lens_del.append(ld)
+            rows.append(j); ks.append(k); future.append(fut)
+    return (np.array(rows), np.array(ks), np.array(future),
+            np.stack(inp_orig), np.stack(inp_mask), np.stack(inp_rep), np.stack(inp_del),
+            np.array(lens_orig), np.array(lens_del))
+
+
+def forward_loss(model, inp, lens, future, item_emb_w, device, bs):
+    """返回 CE loss [M]（eval 模式，无 dropout）。"""
+    import torch.nn.functional as F
+    M = inp.shape[0]
+    losses = np.empty(M, dtype=np.float64)
+    model.eval()
+    with torch.no_grad():
+        for s in range(0, M, bs):
+            e = min(s + bs, M)
+            si = torch.from_numpy(inp[s:e]).to(device)
+            li = torch.from_numpy(lens[s:e]).to(device).long()
+            fi = torch.from_numpy(future[s:e]).to(device).long()
+            out = model.forward(si, li)
+            logits = torch.matmul(out, item_emb_w.transpose(0, 1))
+            losses[s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
+    return losses
+
+
+def forward_loss_dropout(model, inp, lens, future, item_emb_w, device, bs, n_pass, dropout_modules):
+    """n_pass 次 dropout inference，返回 loss [n_pass, M]。"""
+    import torch.nn.functional as F
+    M = inp.shape[0]
+    all_loss = np.empty((n_pass, M), dtype=np.float64)
+    for p in range(n_pass):
+        # 只开 dropout 子模块，其余 eval
+        model.eval()
+        for m in dropout_modules:
+            m.train()
+        with torch.no_grad():
+            for s in range(0, M, bs):
+                e = min(s + bs, M)
+                si = torch.from_numpy(inp[s:e]).to(device)
+                li = torch.from_numpy(lens[s:e]).to(device).long()
+                fi = torch.from_numpy(future[s:e]).to(device).long()
+                out = model.forward(si, li)
+                logits = torch.matmul(out, item_emb_w.transpose(0, 1))
+                all_loss[p, s:e] = F.cross_entropy(logits, fi, reduction="none").cpu().numpy()
+    return all_loss
+
+
+def calibrate_zscore(score, pop_bucket, pos_bucket, clean_mask):
+    """pop×pos 分组 z-score（用 clean 交互估 median/MAD）。"""
+    z = np.full(len(score), np.nan, dtype=np.float64)
+    for (pb, pos) in set(zip(pop_bucket.tolist(), pos_bucket.tolist())):
+        g = (pop_bucket == pb) & (pos_bucket == pos)
+        ref = g & clean_mask
+        if ref.sum() < 5:
+            ref = g          # 组太小退到全组
+        if ref.sum() < 2:
+            z[g] = 0.0
+            continue
+        med = np.median(score[ref])
+        mad = np.median(np.abs(score[ref] - med))
+        z[g] = (score[g] - med) / (1.4826 * mad + 1e-6)
+    z = np.nan_to_num(z, nan=0.0)
+    return z
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
@@ -46,30 +173,33 @@ def main():
     parser.add_argument("--noise_seed", type=int, default=2024)
     parser.add_argument("--noise_position", default="last")
     parser.add_argument("--checkpoint_dir", required=True)
-    parser.add_argument("--early_ckpt", default=None,
-                        help="早期 checkpoint 路径，用于审计记忆效应；默认用 checkpoint_dir 最新的")
+    parser.add_argument("--early_ckpt", default=None)
     parser.add_argument("--sample_ratio", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--out", default=None)
     parser.add_argument("--config_files", default=None)
+    # Stage 1 新参数
+    parser.add_argument("--horizons", default="1,3,5")
+    parser.add_argument("--n_dropout", type=int, default=3)
+    parser.add_argument("--alpha_weights", default="0.5,0.3,0.2")
     args = parser.parse_args()
+    horizons = [int(x) for x in args.horizons.split(",")]
+    alpha_w = [float(x) for x in args.alpha_weights.split(",")]
+    # 对齐 alpha_w 到 horizons
+    if len(alpha_w) < len(horizons):
+        alpha_w = alpha_w + [alpha_w[-1]] * (len(horizons) - len(alpha_w))
+    alpha_w = np.array(alpha_w[:len(horizons)])
+    alpha_w = alpha_w / alpha_w.sum()
 
     config_dict = {
-        "noise_type": args.noise_type,
-        "noise_ratio": args.noise_ratio,
-        "noise_seed": args.noise_seed,
-        "noise_position": args.noise_position,
-        "checkpoint_dir": args.checkpoint_dir,
-        "show_progress": False,
-        "use_gpu": True,
-        "gpu_id": args.gpu_id,
+        "noise_type": args.noise_type, "noise_ratio": args.noise_ratio,
+        "noise_seed": args.noise_seed, "noise_position": args.noise_position,
+        "checkpoint_dir": args.checkpoint_dir, "show_progress": False,
+        "use_gpu": True, "gpu_id": args.gpu_id,
     }
-    config = Config(
-        model=args.model,
-        dataset=args.dataset,
-        config_file_list=[args.config_files] if args.config_files else None,
-        config_dict=config_dict,
-    )
+    config = Config(model=args.model, dataset=args.dataset,
+                    config_file_list=[args.config_files] if args.config_files else None,
+                    config_dict=config_dict)
     init_seed(config["seed"], config["reproducibility"])
     init_logger(config)
     logger = getLogger()
@@ -77,13 +207,10 @@ def main():
 
     dataset = create_dataset(config)
     train_data, valid_data, test_data = data_preparation(config, dataset)
-
-    # 注入噪声（与训练时同种子），拿到 noise log 标注
     noise_log = inject_noise(train_data._dataset, config, logger=logger)
     corrupted_rows = {e["row"] for e in noise_log}
     logger.info(f"[cfu] corrupted rows = {len(corrupted_rows)}")
 
-    # 加载模型 + checkpoint（可用早期 checkpoint 审计记忆效应）
     model = get_model(config["model"])(config, train_data._dataset).to(device)
     ckpt_path = args.early_ckpt if args.early_ckpt else find_checkpoint(args.checkpoint_dir, args.model)
     state = torch.load(ckpt_path, map_location=device)
@@ -96,124 +223,177 @@ def main():
     seq_field = iid_field + config["LIST_SUFFIX"]
     len_field = config["ITEM_LIST_LENGTH_FIELD"]
     uid_field = config["USER_ID_FIELD"]
-    seq = inter[seq_field]               # [N, max_len]
-    length = inter[len_field]            # [N]
-    target = inter[iid_field]            # [N]
-    uid = inter[uid_field]               # [N]
-    N = seq.shape[0]
+    seq_np = inter[seq_field].numpy()
+    length_np = inter[len_field].numpy()
+    target_np = inter[iid_field].numpy()
+    uid_np = inter[uid_field].numpy()
+    N = seq_np.shape[0]
+    max_len = seq_np.shape[1]
 
-    # 流行度 / tail
-    item_counter = train_data._dataset.item_counter   # Counter: item -> count (train)
+    item_counter = train_data._dataset.item_counter
     pop_map = {int(k): int(v) for k, v in item_counter.items()}
     sorted_items = sorted(pop_map.items(), key=lambda kv: (kv[1], kv[0]))
     tail_ratio = config["tail_ratio"]
     cut = max(int(len(sorted_items) * tail_ratio), 1)
     tail_set = {it for it, _ in sorted_items[:cut]}
 
-    # 采样
-    rng = np.random.RandomState(config["seed"])
-    if args.sample_ratio < 1.0:
-        n_sample = max(1, int(N * args.sample_ratio))
-        rows = rng.choice(N, size=n_sample, replace=False)
-        rows.sort()
-    else:
-        rows = np.arange(N)
+    # pos_bucket：frac = length / user_maxlen
+    user_maxlen = {}
+    for i in range(N):
+        u = int(uid_np[i])
+        if u not in user_maxlen or length_np[i] > user_maxlen[u]:
+            user_maxlen[u] = int(length_np[i])
+    frac = np.array([length_np[i] / max(user_maxlen[int(uid_np[i])], 1) for i in range(N)])
+    pos_bucket = np.where(frac < 0.2, 0, np.where(frac > 0.8, 2, 1))  # 0=early,1=middle,2=recent
+    pop_bucket = np.array([0 if int(seq_np[i, int(length_np[i]) - 1]) in tail_set else 1 for i in range(N)])  # 0=tail,1=head
 
+    # pred_item（单步 del forward 的 argmax，供 replace 用）
+    logger.info("[cfu] computing pred_item (single-step del)...")
     bs = args.batch_size
-    results = []
-    import torch.nn.functional as F
     item_emb_w = model.item_embedding.weight
+    pred_item_np = np.zeros(N, dtype=np.int64)
+    import torch.nn.functional as F
     with torch.no_grad():
-        for start in range(0, len(rows), bs):
-            chunk = rows[start:start + bs]
-            s = seq[chunk].to(device)
-            ln = length[chunk].to(device)
-            tg = target[chunk].to(device)
-            B = s.shape[0]
-            last_pos = (ln - 1).clamp(min=0)
-            rows_idx = torch.arange(B, device=device)
+        for s in range(0, N, bs):
+            e = min(s + bs, N)
+            si = torch.from_numpy(seq_np[s:e]).to(device)
+            li = torch.from_numpy((length_np[s:e] - 1).clip(min=1)).to(device).long()
+            out = model.forward(si, li)
+            dl = torch.matmul(out, item_emb_w.transpose(0, 1))
+            dl[:, 0] = -float("inf")
+            pred_item_np[s:e] = dl.argmax(dim=1).cpu().numpy()
 
-            seq_output = model.forward(s, ln)                 # [B, H]
-            orig = (seq_output * item_emb_w[tg]).sum(dim=1)   # [B]
-            logits = torch.matmul(seq_output, item_emb_w.transpose(0, 1))
-            ce = F.cross_entropy(logits, tg, reduction="none")  # [B]
+    # 多步构造
+    logger.info(f"[cfu] building multistep inputs (horizons={horizons})...")
+    rows, ks, future, inp_o, inp_m, inp_r, inp_d, lens_o, lens_d = build_multistep_inputs(
+        seq_np, length_np, target_np, uid_np, horizons, max_len, pred_item_np)
+    M = len(rows)
+    logger.info(f"[cfu] multistep pairs = {M} (avg {M/N:.2f} horizons/row)")
 
-            # mask: 置 0，保留长度
-            mask_s = s.clone()
-            mask_s[rows_idx, last_pos] = 0
-            m_out = model.forward(mask_s, ln)
-            m_score = (m_out * item_emb_w[tg]).sum(dim=1)
+    # 各视图 forward（orig/mask/del/rep），orig/mask/rep 跑 dropout，del 仅 eval（主指标）
+    dropout_modules = [m for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+    logger.info(f"[cfu] forward 4 views × {args.n_dropout} dropout (orig/mask/rep) + eval (del)...")
+    loss_o = forward_loss_dropout(model, inp_o, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)  # [P,M]
+    loss_m = forward_loss_dropout(model, inp_m, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    loss_r = forward_loss_dropout(model, inp_r, lens_o, future, item_emb_w, device, bs, args.n_dropout, dropout_modules)
+    loss_d = forward_loss(model, inp_d, lens_d, future, item_emb_w, device, bs)  # [M] eval
 
-            # delete: 置 0，长度 -1
-            del_s = mask_s.clone()
-            del_ln = (ln - 1).clamp(min=1)
-            d_out = model.forward(del_s, del_ln)
-            d_score = (d_out * item_emb_w[tg]).sum(dim=1)
+    loss_o_mean = loss_o.mean(axis=0); loss_o_std = loss_o.std(axis=0, ddof=1) if args.n_dropout > 1 else np.zeros(M)
+    loss_m_mean = loss_m.mean(axis=0)
+    loss_r_mean = loss_r.mean(axis=0)
 
-            # pred_item: clean 模型基于前缀对 x_t 的预测 argmax（供 replace 修复用）
-            del_logits = torch.matmul(d_out, item_emb_w.transpose(0, 1))
-            del_logits[:, 0] = -float("inf")  # 排除 padding item
-            pred_item = del_logits.argmax(dim=1).cpu().numpy()
+    # CFU_k = loss_cf - loss_orig（loss 空间，正=有用）
+    cfu_del = loss_d - loss_o_mean
+    cfu_mask = loss_m_mean - loss_o_mean
+    cfu_rep = loss_r_mean - loss_o_mean
 
-            cfu_mask = (orig - m_score).cpu().numpy()
-            cfu_del = (orig - d_score).cpu().numpy()
-            ce_np = ce.cpu().numpy()
-            last_item = s[rows_idx, last_pos].cpu().numpy()
-            for i, r in enumerate(chunk):
-                li = int(last_item[i])
-                results.append({
-                    "row": int(r),
-                    "uid": int(uid[r]),
-                    "position": int(last_pos[i].item()),
-                    "last_item": li,
-                    "future_item": int(target[r]),
-                    "item_popularity": pop_map.get(li, 0),
-                    "is_tail": int(li in tail_set),
-                    "is_injected_noise": int(int(r) in corrupted_rows),
-                    "noise_type": args.noise_type,
-                    "CFU_mask": float(cfu_mask[i]),
-                    "CFU_delete": float(cfu_del[i]),
-                    "orig_loss": float(ce_np[i]),
-                    "pred_item": int(pred_item[i]),
-                })
+    # 按 (row, k) 聚合到每行
+    row_to_idx = {}
+    for idx, r in enumerate(rows):
+        row_to_idx.setdefault(int(r), {})[int(ks[idx])] = idx
 
-    out_path = args.out or os.path.join(
-        "logs", f"cfu_{args.dataset}_{args.noise_type}_{int(args.noise_ratio*100)}_{args.noise_position}.csv"
-    )
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-        writer.writeheader()
-        writer.writerows(results)
-    logger.info(f"[cfu] wrote {len(results)} rows -> {out_path}")
+    # 组装每行结果
+    results = []
+    for j in range(N):
+        L = int(length_np[j])
+        if L < 1:
+            continue
+        li = int(seq_np[j, L - 1])
+        rec = {
+            "row": j, "uid": int(uid_np[j]), "item_length": L,
+            "last_item": li, "future_item": int(target_np[j]),
+            "item_popularity": pop_map.get(li, 0), "is_tail": int(li in tail_set),
+            "pop_bucket": int(pop_bucket[j]), "pos_bucket": int(pos_bucket[j]),
+            "frac": float(frac[j]),
+            "is_injected_noise": int(j in corrupted_rows), "noise_type": args.noise_type,
+            "noise_position": args.noise_position,
+            "pred_item": int(pred_item_np[j]),
+        }
+        hmap = row_to_idx.get(j, {})
+        # 单步（H1）向后兼容列
+        i1 = hmap.get(1)
+        rec["CFU_mask"] = float(cfu_mask[i1]) if i1 is not None else 0.0
+        rec["CFU_delete"] = float(cfu_del[i1]) if i1 is not None else 0.0
+        rec["orig_loss"] = float(loss_o_mean[i1]) if i1 is not None else 0.0
+        # 多步
+        h_del_pass = []  # 每 dropout pass 的 H_del（用 del 是 eval，故 H_del 无 std；用 mask 做 std）
+        for ki, k in enumerate(horizons):
+            idx_k = hmap.get(k)
+            rec[f"CFU_del_H{k}"] = float(cfu_del[idx_k]) if idx_k is not None else float("nan")
+            rec[f"CFU_mask_H{k}"] = float(cfu_mask[idx_k]) if idx_k is not None else float("nan")
+            rec[f"CFU_rep_H{k}"] = float(cfu_rep[idx_k]) if idx_k is not None else float("nan")
+        # H_del = Σ α_k CFU_del_Hk（只对有效 horizon 重归一化）
+        vals = [rec[f"CFU_del_H{k}"] for k in horizons]
+        aw = np.array([alpha_w[i] if not np.isnan(v) else 0.0 for i, v in enumerate(vals)])
+        s_aw = aw.sum()
+        rec["H_del_mean"] = float(sum(aw[i] * vals[i] for i in range(len(vals))) / s_aw) if s_aw > 0 else float("nan")
+        # H_del 不确定性：用 mask 视图各 dropout pass 的 H_mask 做 std 作代理
+        if args.n_dropout > 1 and i1 is not None:
+            pass_H = []
+            for p in range(args.n_dropout):
+                hp = 0.0; sw = 0.0
+                for ki, k in enumerate(horizons):
+                    idx_k = hmap.get(k)
+                    if idx_k is None:
+                        continue
+                    hp += alpha_w[ki] * (loss_m[p, idx_k] - loss_o[p, idx_k])
+                    sw += alpha_w[ki]
+                if sw > 0:
+                    pass_H.append(hp / sw)
+            rec["H_del_std"] = float(np.std(pass_H, ddof=1)) if len(pass_H) > 1 else 0.0
+        else:
+            rec["H_del_std"] = 0.0
+        results.append(rec)
 
-    # 统计
+    # 群体校准 z-score
     import pandas as pd
     df = pd.DataFrame(results)
-    df["CFU"] = df["CFU_delete"]   # 主指标用 delete
+    clean = df["is_injected_noise"].values == 0
+    df["z_CFU_del"] = calibrate_zscore(df["CFU_delete"].values, df["pop_bucket"].values, df["pos_bucket"].values, clean)
+    df["z_H_del"] = calibrate_zscore(df["H_del_mean"].values, df["pop_bucket"].values, df["pos_bucket"].values, clean)
+
+    out_path = args.out or os.path.join(
+        "logs", f"cfu_{args.dataset}_{args.noise_type}_{int(args.noise_ratio*100)}_{args.noise_position}.csv")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df.to_csv(out_path, index=False)
+    logger.info(f"[cfu] wrote {len(df)} rows -> {out_path}")
+
+    # 统计：单步 vs 多步 vs 校准
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    y = df["is_injected_noise"].values
     groups = {
         "clean_real": df[df["is_injected_noise"] == 0],
         "injected_noise": df[df["is_injected_noise"] == 1],
         "real_tail": df[(df["is_injected_noise"] == 0) & (df["is_tail"] == 1)],
         "real_head": df[(df["is_injected_noise"] == 0) & (df["is_tail"] == 0)],
     }
-    print("\n===== CFU separation (CFU_delete) =====")
-    print(f"{'group':<18}{'mean':>10}{'median':>10}{'std':>10}{'n':>8}")
+    print(f"\n===== CFU separation ({args.noise_position}) =====")
+    print(f"{'group':<16}{'CFU_del':>10}{'H_del':>10}{'z_H_del':>10}{'H_std':>10}{'n':>8}")
     for name, g in groups.items():
         if len(g):
-            print(f"{name:<18}{g['CFU'].mean():>10.4f}{g['CFU'].median():>10.4f}"
-                  f"{g['CFU'].std():>10.4f}{len(g):>8}")
-    # 简易 AUC：能否区分 real vs injected
-    from sklearn.metrics import roc_auc_score, average_precision_score
-    try:
-        y = df["is_injected_noise"].values
-        # 注入噪声应 CFU 更低 -> 用 -CFU 作为 "noise score"
-        auc = roc_auc_score(y, -df["CFU_delete"].values)
-        pr_auc = average_precision_score(y, -df["CFU_delete"].values)
-        print(f"\nROC-AUC(injected vs real by -CFU_delete) = {auc:.4f}")
-        print(f"PR-AUC (injected vs real by -CFU_delete) = {pr_auc:.4f}  (noise prior={y.mean():.3f})")
-    except Exception as e:
-        print(f"[auc] skipped: {e}")
+            print(f"{name:<16}{g['CFU_delete'].mean():>10.4f}{g['H_del_mean'].mean():>10.4f}"
+                  f"{g['z_H_del'].mean():>10.4f}{g['H_del_std'].mean():>10.4f}{len(g):>8}")
+    for col, label in [("CFU_delete", "single-step"), ("H_del_mean", "multi-step"), ("z_H_del", "calibrated")]:
+        try:
+            auc = roc_auc_score(y, -df[col].values)
+            pr = average_precision_score(y, -df[col].values)
+            print(f"{label:<12} ROC-AUC={auc:.4f}  PR-AUC={pr:.4f}")
+        except Exception as e:
+            print(f"{label}: {e}")
+    # 覆盖率
+    for k in horizons:
+        cov = df[f"CFU_del_H{k}"].notna().mean()
+        print(f"H={k} coverage={cov:.3f}")
+    # 各位置 ROC（若多位置）
+    print("\n-- per pos_bucket ROC (z_H_del) --")
+    for pb, name in [(0, "early-ish"), (1, "middle"), (2, "recent")]:
+        sub = df[df["pos_bucket"] == pb]
+        if sub["is_injected_noise"].sum() > 0 and (sub["is_injected_noise"] == 0).sum() > 0:
+            try:
+                a = roc_auc_score(sub["is_injected_noise"], -sub["z_H_del"])
+                print(f"  pos={name}: ROC={a:.4f} n={len(sub)}")
+            except Exception:
+                pass
 
     # 分布图
     try:
@@ -221,16 +401,12 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(6, 4))
-        for name, g in [("clean_real", groups["clean_real"]),
-                        ("injected_noise", groups["injected_noise"])]:
+        for name, g in [("clean_real", groups["clean_real"]), ("injected_noise", groups["injected_noise"])]:
             if len(g):
-                g["CFU_delete"].clip(-5, 5).hist(bins=50, ax=ax, alpha=0.5, label=name, density=True)
-        ax.set_xlabel("CFU_delete")
-        ax.set_title(f"{args.dataset} {args.noise_type} {int(args.noise_ratio*100)}%")
-        ax.legend()
-        plot_path = out_path.replace(".csv", ".png")
-        plt.savefig(plot_path, dpi=120, bbox_inches="tight")
-        logger.info(f"[cfu] plot -> {plot_path}")
+                g["H_del_mean"].clip(-5, 5).hist(bins=50, ax=ax, alpha=0.5, label=name, density=True)
+        ax.set_xlabel("H_del"); ax.legend()
+        plt.savefig(out_path.replace(".csv", ".png"), dpi=120, bbox_inches="tight")
+        logger.info(f"[cfu] plot -> {out_path.replace('.csv', '.png')}")
     except Exception as e:
         logger.info(f"[cfu] plot skipped: {e}")
 
