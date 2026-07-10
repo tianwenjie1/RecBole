@@ -87,16 +87,19 @@ log "===== Phase 4 done ====="
 # ---------- Phase 5: CFU-guided input repair 训练（救判断点 C）----------
 log "===== Phase 5: input repair ====="
 python scripts/build_repair.py --cfu_csv logs/cfu_beauty_random_10.csv \
-  --strategy cfu_mask         --out logs/repair_cfu_mask.csv         > logs/repair_cfu_mask.log 2>&1
+  --selection percentile --low_pct 20 --action mask  --tail_protect 0 \
+  --out logs/repair_cfu_mask.csv         > logs/repair_cfu_mask.log 2>&1
 python scripts/build_repair.py --cfu_csv logs/cfu_beauty_random_10.csv \
-  --strategy cfu_mask_tail    --out logs/repair_cfu_mask_tail.csv    > logs/repair_cfu_mask_tail.log 2>&1
+  --selection percentile --low_pct 20 --action mask  --tail_protect 1 \
+  --out logs/repair_cfu_mask_tail.csv    > logs/repair_cfu_mask_tail.log 2>&1
 python scripts/build_repair.py --cfu_csv logs/cfu_beauty_random_10.csv \
-  --strategy cfu_replace_tail --out logs/repair_cfu_replace_tail.csv > logs/repair_cfu_replace_tail.log 2>&1
+  --selection percentile --low_pct 20 --action replace --tail_protect 1 \
+  --out logs/repair_cfu_replace_tail.csv > logs/repair_cfu_replace_tail.log 2>&1
 
 run_repair_train() {  # $1=strategy $2=repair_file $3=logtag
   python run_recbole.py -m $MODEL -d $DS \
     --gpu_id=2 \
-    --noise_type=random --noise_ratio=0.1 --noise_seed=2024 \
+    --noise_type=random --noise_ratio=0.1 --noise_seed=2024 --noise_position=last \
     --use_input_repair=True --repair_file=$2 \
     --checkpoint_dir=saved/beauty_$1 --epochs=$EPOCHS \
     > "logs/train_beauty_sasrec_$3.log" 2>&1

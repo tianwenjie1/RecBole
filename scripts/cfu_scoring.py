@@ -44,7 +44,10 @@ def main():
     parser.add_argument("--noise_type", default="random")
     parser.add_argument("--noise_ratio", type=float, default=0.1)
     parser.add_argument("--noise_seed", type=int, default=2024)
+    parser.add_argument("--noise_position", default="last")
     parser.add_argument("--checkpoint_dir", required=True)
+    parser.add_argument("--early_ckpt", default=None,
+                        help="早期 checkpoint 路径，用于审计记忆效应；默认用 checkpoint_dir 最新的")
     parser.add_argument("--sample_ratio", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--out", default=None)
@@ -55,6 +58,7 @@ def main():
         "noise_type": args.noise_type,
         "noise_ratio": args.noise_ratio,
         "noise_seed": args.noise_seed,
+        "noise_position": args.noise_position,
         "checkpoint_dir": args.checkpoint_dir,
         "show_progress": False,
         "use_gpu": True,
@@ -79,9 +83,9 @@ def main():
     corrupted_rows = {e["row"] for e in noise_log}
     logger.info(f"[cfu] corrupted rows = {len(corrupted_rows)}")
 
-    # 加载模型 + clean checkpoint
+    # 加载模型 + checkpoint（可用早期 checkpoint 审计记忆效应）
     model = get_model(config["model"])(config, train_data._dataset).to(device)
-    ckpt_path = find_checkpoint(args.checkpoint_dir, args.model)
+    ckpt_path = args.early_ckpt if args.early_ckpt else find_checkpoint(args.checkpoint_dir, args.model)
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["state_dict"])
     model.eval()
@@ -174,7 +178,7 @@ def main():
                 })
 
     out_path = args.out or os.path.join(
-        "logs", f"cfu_{args.dataset}_{args.noise_type}_{int(args.noise_ratio*100)}.csv"
+        "logs", f"cfu_{args.dataset}_{args.noise_type}_{int(args.noise_ratio*100)}_{args.noise_position}.csv"
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", newline="") as f:
@@ -200,12 +204,14 @@ def main():
             print(f"{name:<18}{g['CFU'].mean():>10.4f}{g['CFU'].median():>10.4f}"
                   f"{g['CFU'].std():>10.4f}{len(g):>8}")
     # 简易 AUC：能否区分 real vs injected
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import roc_auc_score, average_precision_score
     try:
         y = df["is_injected_noise"].values
         # 注入噪声应 CFU 更低 -> 用 -CFU 作为 "noise score"
         auc = roc_auc_score(y, -df["CFU_delete"].values)
-        print(f"\nAUC(injected vs real by -CFU_delete) = {auc:.4f}")
+        pr_auc = average_precision_score(y, -df["CFU_delete"].values)
+        print(f"\nROC-AUC(injected vs real by -CFU_delete) = {auc:.4f}")
+        print(f"PR-AUC (injected vs real by -CFU_delete) = {pr_auc:.4f}  (noise prior={y.mean():.3f})")
     except Exception as e:
         print(f"[auc] skipped: {e}")
 

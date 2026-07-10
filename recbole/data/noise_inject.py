@@ -47,6 +47,7 @@ def inject_noise(train_dataset, config, logger=None):
     noise_type = config["noise_type"]
     noise_ratio = float(config["noise_ratio"])
     seed = int(config["noise_seed"])
+    noise_position = config["noise_position"] if "noise_position" in config else "last"
 
     rng = np.random.RandomState(seed)
     noise_log = []
@@ -68,10 +69,40 @@ def inject_noise(train_dataset, config, logger=None):
     N, max_len = item_seq.shape
     item_num = int(train_dataset.num(iid_field))
 
-    # 选中要污染的行（每个独立行一次）
+    # 按位置 band 选行：frac = item_length / 该 user 最大 item_length
+    len_np = item_len.numpy()
+    uid_np = uids.numpy()
+    user_maxlen = {}
+    for i in range(N):
+        u = int(uid_np[i])
+        if u not in user_maxlen or len_np[i] > user_maxlen[u]:
+            user_maxlen[u] = int(len_np[i])
+    frac = np.array([len_np[i] / max(user_maxlen[int(uid_np[i])], 1) for i in range(N)])
+    if noise_position == "last":
+        # 每 user 仅最大 item_length 那行（紧邻 target）
+        seen = {}
+        band_rows = []
+        for i in range(N):
+            u = int(uid_np[i])
+            if len_np[i] == user_maxlen[u] and u not in seen:
+                seen[u] = True
+                band_rows.append(i)
+        band = np.array(band_rows, dtype=int)
+    elif noise_position == "recent":
+        band = np.where(frac > 0.8)[0]
+    elif noise_position == "middle":
+        band = np.where((frac >= 0.4) & (frac <= 0.6))[0]
+    elif noise_position == "early":
+        band = np.where(frac < 0.2)[0]
+    else:  # uniform
+        band = np.arange(N)
+    if len(band) == 0:
+        band = np.arange(N)
+
+    # 选中要污染的行（noise_ratio 比例的总行数，从 band 内采）
     n_rows = int(round(N * noise_ratio))
-    n_rows = max(1, min(n_rows, N - 1))
-    row_idx = rng.choice(N, size=n_rows, replace=False)
+    n_rows = max(1, min(n_rows, len(band)))
+    row_idx = rng.choice(band, size=n_rows, replace=False)
 
     # 采样替换 item
     if noise_type == "random":
@@ -108,6 +139,7 @@ def inject_noise(train_dataset, config, logger=None):
             "new_item": new,
             "target_item": int(targets[r].item()),
             "noise_type": noise_type,
+            "noise_position": noise_position,
         })
 
     # 写回
@@ -118,18 +150,18 @@ def inject_noise(train_dataset, config, logger=None):
     os.makedirs(log_dir, exist_ok=True)
     dataset_name = config["dataset"]
     log_path = os.path.join(
-        log_dir, f"noise_{dataset_name}_{noise_type}_{int(noise_ratio*100)}_seed{seed}.csv"
+        log_dir, f"noise_{dataset_name}_{noise_type}_{int(noise_ratio*100)}_{noise_position}_seed{seed}.csv"
     )
     with open(log_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "uid", "row", "position", "orig_item", "new_item", "target_item", "noise_type"
+            "uid", "row", "position", "orig_item", "new_item", "target_item", "noise_type", "noise_position"
         ])
         writer.writeheader()
         writer.writerows(noise_log)
 
     if logger is not None:
         logger.info(
-            f"[noise_inject] type={noise_type} ratio={noise_ratio} "
-            f"rows={N} corrupted={len(noise_log)} log={log_path}"
+            f"[noise_inject] type={noise_type} ratio={noise_ratio} position={noise_position} "
+            f"rows={N} band={len(band)} corrupted={len(noise_log)} log={log_path}"
         )
     return noise_log

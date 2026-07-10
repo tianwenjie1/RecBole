@@ -1,45 +1,33 @@
 # -*- coding: utf-8 -*-
-# 解析 logs/train_*.log 里的 'test result' 行 + cfu 打分统计，汇总成 RESULTS.md
+# 解析日志生成 RESULTS.md。
+# 支持 sweep 日志（sweep_train_<ds>_random_10_<pos>_<sel>_seed<seed>.log）+ repair_*.json 诊断。
+# 同时解析 valid 和 test，按 valid NDCG@20 选最优，报告对应 test。
 import os
 import re
 import glob
+import json
 import ast
 from datetime import datetime
 
 LOG_DIR = "logs"
 OUT = "RESULTS.md"
 
-# train_beauty_sasrec_<tag>.log  ->  tag 描述
-TAG_DESC = {
-    "none_0": ("Clean SASRec", "none", 0.0),
-    "random_10": ("Random 10%", "random", 0.1),
-    "random_20": ("Random 20%", "random", 0.2),
-    "pop_10": ("PopNoise 10%", "popularity", 0.1),
-    "pop_20": ("PopNoise 20%", "popularity", 0.2),
-    "cfu_only": ("Noisy + CFU-only", "random", 0.1),
-    "loss_reweight": ("Noisy + loss-reweight", "random", 0.1),
-    "cfu_tail": ("Noisy + CFU+tail", "random", 0.1),
-    "cfu_mask": ("Noisy + CFU-mask repair", "random", 0.1),
-    "cfu_mask_tail": ("Noisy + CFU-mask+tail", "random", 0.1),
-    "cfu_replace_tail": ("Noisy + CFU-replace+tail", "random", 0.1),
-}
+METRIC_KEYS = ["recall@20", "ndcg@20", "tailrecall@20", "tailndcg@20"]
 
 
-def parse_test_result(path):
-    """从 log 里抓最后一行 'test result: OrderedDict([...])' 解析成 dict。"""
+def parse_result_line(path, keyword):
+    """从 log 抓最后一条 keyword 行（'valid result'/'test result'），解析 OrderedDict。"""
     if not os.path.exists(path):
         return None
     last = None
     with open(path, "r", errors="ignore") as f:
         for line in f:
-            if "test result" in line:
+            if keyword in line:
                 last = line
     if last is None:
         return None
-    # 形如: ('recall@20', np.float64(0.2246))
     pairs = re.findall(r"\('([\w@]+)',\s*np\.float64\(([\d.]+)\)\)", last)
     if not pairs:
-        # 兼容旧版纯 dict 格式 {'recall@10': 0.x, ...}
         m = re.search(r"test result.*?(\{.*\})", last)
         if m:
             try:
@@ -51,91 +39,95 @@ def parse_test_result(path):
 
 
 def fmt(d, key):
-    if d is None or key not in d:
+    if not d or key not in d:
         return "-"
     return f"{d[key]:.4f}"
 
 
+def load_repair_json(pos, sel):
+    # repair_<pos>_<sel>.json
+    p = os.path.join(LOG_DIR, f"repair_{pos}_{sel}.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            return json.load(f)
+    return None
+
+
 def main():
-    lines = []
-    lines.append(f"# 实验结果汇总（自动生成 {datetime.now():%F %T}）\n")
-    lines.append("数据集: Amazon Beauty (5-core) | 模型: SASRec | seed=2024\n")
+    lines = [f"# 实验结果汇总（自动生成 {datetime.now():%F %T}）\n"]
+    lines.append("数据集: Amazon Beauty (2014 5-core) | 模型: SASRec | noise=random 10%\n")
 
-    # ---- 表1: 噪声下降曲线 ----
-    lines.append("\n## 表1 噪声下降曲线 (判断点 A)\n")
-    lines.append("| Setting | Recall@20 | NDCG@20 | TailRecall@20 | TailNDCG@20 |")
-    lines.append("|---|---|---|---|---|")
-    order = ["none_0", "random_10", "random_20", "pop_10", "pop_20"]
-    for tag in order:
-        desc = TAG_DESC[tag][0]
-        r = parse_test_result(os.path.join(LOG_DIR, f"train_beauty_sasrec_{tag}.log"))
-        lines.append(f"| {desc} | {fmt(r,'recall@20')} | {fmt(r,'ndcg@20')} "
-                     f"| {fmt(r,'tailrecall@20')} | {fmt(r,'tailndcg@20')} |")
-    lines.append("\n> 判定：噪声下 NDCG@20 / TailNDCG@20 应明显低于 Clean。")
+    # ===== sweep 表（读 meta json）=====
+    metas = sorted(glob.glob(os.path.join(LOG_DIR, "meta__*.json")))
+    if metas:
+        lines.append("\n## Sweep：噪声位置 × 选择策略（seed 42）\n")
+        lines.append("按 valid NDCG@20 选最优；test 为该阈值对应值。")
+        lines.append("\n| position | selection | NDCG@20(valid) | NDCG@20(test) | Recall@20 | TailRecall@20 | TailNDCG@20 | noise_prec | noise_recall | tail_FRR |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        rows = []
+        for mf in metas:
+            with open(mf) as f:
+                meta = json.load(f)
+            pos, sel, seed = meta["pos"], meta["sel"], meta.get("seed", "")
+            log = meta["log"]
+            valid = parse_result_line(log, "valid result")
+            test = parse_result_line(log, "test result")
+            diag = {}
+            rj = meta.get("repair_json")
+            if rj and os.path.exists(rj):
+                with open(rj) as f:
+                    diag = json.load(f)
+            rows.append({
+                "pos": pos, "sel": sel, "seed": seed,
+                "valid": valid, "test": test, "diag": diag,
+            })
+        # 排序：position, 然后 valid ndcg 降序
+        rows.sort(key=lambda r: (r["pos"], -((r["valid"] or {}).get("ndcg@20", -1))))
+        for r in rows:
+            v, t, d = r["valid"], r["test"], r["diag"]
+            def df(key):
+                val = d.get(key)
+                return f"{val:.4f}" if isinstance(val, (int, float)) else "-"
+            lines.append(
+                f"| {r['pos']} | {r['sel']} | {fmt(v,'ndcg@20')} | {fmt(t,'ndcg@20')} "
+                f"| {fmt(t,'recall@20')} | {fmt(t,'tailrecall@20')} | {fmt(t,'tailndcg@20')} "
+                f"| {df('noise_precision')} | {df('noise_recall')} | {df('tail_false_repair_rate')} |"
+            )
+        # 每个 position 的 best-by-valid
+        lines.append("\n### 各 position 下 valid 最优 selection\n")
+        lines.append("| position | best selection | valid NDCG@20 | test NDCG@20 | test TailNDCG@20 |")
+        lines.append("|---|---|---|---|---|")
+        seen = {}
+        for r in rows:
+            if r["pos"] not in seen:
+                seen[r["pos"]] = r
+        for pos, r in seen.items():
+            lines.append(f"| {pos} | {r['sel']} | {fmt(r['valid'],'ndcg@20')} | {fmt(r['test'],'ndcg@20')} | {fmt(r['test'],'tailndcg@20')} |")
 
-    # ---- 表3: CFU-weight 对比 ----
-    lines.append("\n## 表3 CFU-weight 性能保持 (判断点 C, Beauty random-10)\n")
-    lines.append("| Setting | Recall@20 | NDCG@20 | TailRecall@20 | TailNDCG@20 |")
-    lines.append("|---|---|---|---|---|")
-    for tag in ["none_0", "random_10", "loss_reweight", "cfu_only", "cfu_tail",
-                "cfu_mask", "cfu_mask_tail", "cfu_replace_tail"]:
-        desc = TAG_DESC[tag][0]
-        r = parse_test_result(os.path.join(LOG_DIR, f"train_beauty_sasrec_{tag}.log"))
-        lines.append(f"| {desc} | {fmt(r,'recall@20')} | {fmt(r,'ndcg@20')} "
-                     f"| {fmt(r,'tailrecall@20')} | {fmt(r,'tailndcg@20')} |")
-    lines.append("\n> 判定：CFU-only/CFU+tail 应优于 Noisy 与 loss-reweight。")
+    # ===== 旧 run_all 表（若存在）=====
+    lines.append("\n## 旧 run_all 结果（若 sweep 未覆盖）\n")
+    old_tags = {
+        "none_0": "Clean", "random_10": "Noisy", "random_20": "Random20",
+        "pop_10": "PopNoise10", "pop_20": "PopNoise20",
+        "loss_reweight": "loss-reweight", "cfu_mask": "CFU-mask",
+        "cfu_mask_tail": "CFU-mask+tail", "cfu_replace_tail": "CFU-replace+tail",
+    }
+    lines.append("\n| Setting | NDCG@20 | Recall@20 | TailNDCG@20 |")
+    lines.append("|---|---|---|---|")
+    for tag, desc in old_tags.items():
+        t = parse_result_line(os.path.join(LOG_DIR, f"train_beauty_sasrec_{tag}.log"), "test result")
+        if t:
+            lines.append(f"| {desc} | {fmt(t,'ndcg@20')} | {fmt(t,'recall@20')} | {fmt(t,'tailndcg@20')} |")
 
-    # ---- 表2: CFU 区分能力 ----
-    lines.append("\n## 表2 CFU 区分能力 (判断点 B 命门)\n")
-    for tag in ["random_10", "pop_10"]:
-        cfu_log = os.path.join(LOG_DIR, f"cfu_beauty_{tag}.log")
-        lines.append(f"\n### {tag}")
-        if os.path.exists(cfu_log):
-            with open(cfu_log, "r", errors="ignore") as f:
-                txt = f.read()
-            # 抓 ===== CFU separation ===== 到结尾
-            idx = txt.find("===== CFU separation")
-            if idx >= 0:
-                block = txt[idx:].strip()
-                lines.append("```\n" + block + "\n```")
-            else:
-                lines.append("(CFU 统计未找到，检查 cfu log)")
-        else:
-            lines.append(f"(缺失 {cfu_log})")
-
-    # ---- TMR: 从 build_weights 日志抓 ----
-    lines.append("\n## 表4 TMR (判断点 D)\n")
-    for tag in ["loss_reweight", "cfu_only", "cfu_tail"]:
-        wlog = os.path.join(LOG_DIR, f"w_{tag}.log")
-        lines.append(f"\n### {tag}")
-        if os.path.exists(wlog):
-            with open(wlog, "r", errors="ignore") as f:
-                txt = f.read()
-            for ln in txt.splitlines():
-                if "TMR" in ln or "noise down" in ln or "weight stats" in ln:
-                    lines.append(ln)
-        else:
-            lines.append(f"(缺失 {wlog})")
-
-    lines.append("\n## 表5 input repair 召回/误伤（build_repair 日志）\n")
-    for tag in ["cfu_mask", "cfu_mask_tail", "cfu_replace_tail"]:
-        rlog = os.path.join(LOG_DIR, f"repair_{tag}.log")
-        lines.append(f"\n### {tag}")
-        if os.path.exists(rlog):
-            with open(rlog, "r", errors="ignore") as f:
-                for ln in f:
-                    if "repaired" in ln or "recall" in ln or "误伤" in ln or "Counter" in ln or "low_thr" in ln:
-                        lines.append(ln.rstrip())
-        else:
-            lines.append(f"(缺失 {rlog})")
-
-    lines.append("\n## CFU 分布图\n")
-    for p in sorted(glob.glob("logs/cfu_*.png")):
-        lines.append(f"- {p}")
-
-    lines.append("\n---\n## 原始日志\n")
-    for p in sorted(glob.glob("logs/*.log")):
-        lines.append(f"- {p}")
+    # ===== CFU 分离（命门 B）=====
+    lines.append("\n## CFU 分离（命门 B）\n")
+    for cfu_log in sorted(glob.glob(os.path.join(LOG_DIR, "cfu_*_random_10_*.log"))):
+        base = os.path.basename(cfu_log).replace(".log", "")
+        with open(cfu_log, "r", errors="ignore") as f:
+            txt = f.read()
+        idx = txt.find("===== CFU separation")
+        lines.append(f"\n### {base}")
+        lines.append("```\n" + (txt[idx:].strip() if idx >= 0 else "(无统计)") + "\n```")
 
     with open(OUT, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

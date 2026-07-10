@@ -55,6 +55,7 @@ tail_ratio: 0.2                    # (float) tail item 占比，用于 TailRecal
 noise_type: none                   # none / random / popularity / context_mismatch
 noise_ratio: 0.0
 noise_seed: 2024
+noise_position: last               # last / recent / middle / early / uniform
 noise_log_dir: 'logs'
 # === CFU 权重训练 ===
 use_cfu_weight: False
