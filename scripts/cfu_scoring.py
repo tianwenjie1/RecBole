@@ -81,22 +81,31 @@ def build_multistep_inputs(seq_np, length_np, target_np, uid_np, horizons, max_l
             bridge = target_np[j:j + k - 1].tolist()     # x_{t+1}..x_{t+k-1}（k-1 个）
             fut = int(target_np[j + k - 1])               # x_{t+k}
             logical_orig = prefix + bridge                # 长 L+k-1
-            xt_pad_pos = max_len - k                      # x_t 在 padded 中的列号
-            # orig/mask/rep 长 L+k-1
+            # 左对齐（RecBole item_id_list 是左对齐，forward 在 len-1 处 gather）
             arr_o = np.zeros(max_len, dtype=np.int64)
             arr_m = np.zeros(max_len, dtype=np.int64)
             arr_r = np.zeros(max_len, dtype=np.int64)
-            lo = min(len(logical_orig), max_len)
-            arr_o[max_len - lo:] = logical_orig[-lo:]
-            arr_m[max_len - lo:] = logical_orig[-lo:]
-            arr_r[max_len - lo:] = logical_orig[-lo:]
-            arr_m[xt_pad_pos] = 0
-            arr_r[xt_pad_pos] = int(pred_item_np[j])
+            if len(logical_orig) > max_len:
+                keep = logical_orig[-max_len:]            # 窗口超长保留最近 max_len
+                lo = max_len
+            else:
+                keep = logical_orig
+                lo = len(logical_orig)
+            arr_o[:lo] = keep
+            arr_m[:lo] = keep
+            arr_r[:lo] = keep
+            xt_pos = lo - k                                # x_t 在左对齐数组中的位置
+            arr_m[xt_pos] = 0
+            arr_r[xt_pos] = int(pred_item_np[j])
             # del 长 L+k-2（删 x_t）
             logical_del = prefix[:L - 1] + bridge
             arr_d = np.zeros(max_len, dtype=np.int64)
-            ld = min(len(logical_del), max_len)
-            arr_d[max_len - ld:] = logical_del[-ld:]
+            if len(logical_del) > max_len:
+                arr_d[:max_len] = logical_del[-max_len:]
+                ld = max_len
+            else:
+                arr_d[:len(logical_del)] = logical_del
+                ld = len(logical_del)
             inp_orig.append(arr_o); inp_mask.append(arr_m); inp_rep.append(arr_r); inp_del.append(arr_d)
             lens_orig.append(max(lo, 1))      # clamp ≥1 防 gather 越界（L=1 时 del 为空）
             lens_del.append(max(ld, 1))
@@ -323,11 +332,14 @@ def main():
             rec[f"CFU_del_H{k}"] = float(cfu_del[idx_k]) if idx_k is not None else float("nan")
             rec[f"CFU_mask_H{k}"] = float(cfu_mask[idx_k]) if idx_k is not None else float("nan")
             rec[f"CFU_rep_H{k}"] = float(cfu_rep[idx_k]) if idx_k is not None else float("nan")
-        # H_del = Σ α_k CFU_del_Hk（只对有效 horizon 重归一化）
+        # H_del = Σ α_k CFU_del_Hk（只对有效 horizon 重归一化，跳过 NaN 防 0*nan 污染）
         vals = [rec[f"CFU_del_H{k}"] for k in horizons]
-        aw = np.array([alpha_w[i] if not np.isnan(v) else 0.0 for i, v in enumerate(vals)])
-        s_aw = aw.sum()
-        rec["H_del_mean"] = float(sum(aw[i] * vals[i] for i in range(len(vals))) / s_aw) if s_aw > 0 else float("nan")
+        num = 0.0; den = 0.0
+        for i, v in enumerate(vals):
+            if not np.isnan(v):
+                num += alpha_w[i] * v
+                den += alpha_w[i]
+        rec["H_del_mean"] = float(num / den) if den > 0 else 0.0
         # H_del 不确定性：用 mask 视图各 dropout pass 的 H_mask 做 std 作代理
         if args.n_dropout > 1 and i1 is not None:
             pass_H = []
