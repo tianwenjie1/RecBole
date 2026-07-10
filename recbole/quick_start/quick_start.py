@@ -139,6 +139,11 @@ def run_recbole(
     from recbole.data.noise_inject import inject_noise
     inject_noise(train_data._dataset, config, logger=logger)
 
+    # === CFU-guided input repair：修复低效用历史 item（输入层，保留真实目标）===
+    if config["use_input_repair"]:
+        from recbole.data.input_repair import apply_repair
+        apply_repair(train_data._dataset, config, logger=logger)
+
     # === CFU per-row 权重：把权重列挂到 train_dataset 上 ===
     if config["use_cfu_weight"]:
         from recbole.utils.cfu_weight import attach_cfu_weights

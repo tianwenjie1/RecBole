@@ -59,4 +59,7 @@ noise_log_dir: 'logs'
 # === CFU 权重训练 ===
 use_cfu_weight: False
 cfu_weight_file: ~
-cfu_weight_field: 'cfu_weight'         # (int) The decimal place of metric scores.
+cfu_weight_field: 'cfu_weight'
+# === CFU-guided input repair ===
+use_input_repair: False
+repair_file: ~         # (int) The decimal place of metric scores.

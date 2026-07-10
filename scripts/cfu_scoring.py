@@ -146,6 +146,11 @@ def main():
             d_out = model.forward(del_s, del_ln)
             d_score = (d_out * item_emb_w[tg]).sum(dim=1)
 
+            # pred_item: clean 模型基于前缀对 x_t 的预测 argmax（供 replace 修复用）
+            del_logits = torch.matmul(d_out, item_emb_w.transpose(0, 1))
+            del_logits[:, 0] = -float("inf")  # 排除 padding item
+            pred_item = del_logits.argmax(dim=1).cpu().numpy()
+
             cfu_mask = (orig - m_score).cpu().numpy()
             cfu_del = (orig - d_score).cpu().numpy()
             ce_np = ce.cpu().numpy()
@@ -165,6 +170,7 @@ def main():
                     "CFU_mask": float(cfu_mask[i]),
                     "CFU_delete": float(cfu_del[i]),
                     "orig_loss": float(ce_np[i]),
+                    "pred_item": int(pred_item[i]),
                 })
 
     out_path = args.out or os.path.join(

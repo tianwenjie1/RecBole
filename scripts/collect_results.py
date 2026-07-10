@@ -19,6 +19,9 @@ TAG_DESC = {
     "cfu_only": ("Noisy + CFU-only", "random", 0.1),
     "loss_reweight": ("Noisy + loss-reweight", "random", 0.1),
     "cfu_tail": ("Noisy + CFU+tail", "random", 0.1),
+    "cfu_mask": ("Noisy + CFU-mask repair", "random", 0.1),
+    "cfu_mask_tail": ("Noisy + CFU-mask+tail", "random", 0.1),
+    "cfu_replace_tail": ("Noisy + CFU-replace+tail", "random", 0.1),
 }
 
 
@@ -74,7 +77,8 @@ def main():
     lines.append("\n## 表3 CFU-weight 性能保持 (判断点 C, Beauty random-10)\n")
     lines.append("| Setting | Recall@20 | NDCG@20 | TailRecall@20 | TailNDCG@20 |")
     lines.append("|---|---|---|---|---|")
-    for tag in ["none_0", "random_10", "loss_reweight", "cfu_only", "cfu_tail"]:
+    for tag in ["none_0", "random_10", "loss_reweight", "cfu_only", "cfu_tail",
+                "cfu_mask", "cfu_mask_tail", "cfu_replace_tail"]:
         desc = TAG_DESC[tag][0]
         r = parse_test_result(os.path.join(LOG_DIR, f"train_beauty_sasrec_{tag}.log"))
         lines.append(f"| {desc} | {fmt(r,'recall@20')} | {fmt(r,'ndcg@20')} "
@@ -112,6 +116,18 @@ def main():
                     lines.append(ln)
         else:
             lines.append(f"(缺失 {wlog})")
+
+    lines.append("\n## 表5 input repair 召回/误伤（build_repair 日志）\n")
+    for tag in ["cfu_mask", "cfu_mask_tail", "cfu_replace_tail"]:
+        rlog = os.path.join(LOG_DIR, f"repair_{tag}.log")
+        lines.append(f"\n### {tag}")
+        if os.path.exists(rlog):
+            with open(rlog, "r", errors="ignore") as f:
+                for ln in f:
+                    if "repaired" in ln or "recall" in ln or "误伤" in ln or "Counter" in ln or "low_thr" in ln:
+                        lines.append(ln.rstrip())
+        else:
+            lines.append(f"(缺失 {rlog})")
 
     lines.append("\n## CFU 分布图\n")
     for p in sorted(glob.glob("logs/cfu_*.png")):
